@@ -60,7 +60,7 @@ class YoloNode(LifecycleNode):
 
         self.declare_parameter("threshold", 0.5)
         self.declare_parameter("iou", 0.5)
-        self.declare_parameter("imgsz_height", 640)
+        self.declare_parameter("imgsz_height", 480)
         self.declare_parameter("imgsz_width", 640)
         self.declare_parameter("half", False)
         self.declare_parameter("max_det", 300)

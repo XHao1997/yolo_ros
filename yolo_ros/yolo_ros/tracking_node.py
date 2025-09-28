@@ -1,3 +1,5 @@
+#!/venv/bin/env python3
+
 # Copyright (C) 2023 Miguel Ángel González Santamarta
 
 # This program is free software: you can redistribute it and/or modify

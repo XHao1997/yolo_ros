@@ -127,65 +127,147 @@ class DebugNode(LifecycleNode):
         super().on_cleanup(state)
         self.get_logger().info(f"[{self.get_name()}] Shutted down")
         return TransitionCallbackReturn.SUCCESS
+    
+    def _draw_filled_transparent_rect(self, img, pt1, pt2, color, alpha=0.6, border=2, radius=10, shadow=3):
+        """
+        Fancy rounded pill:
+        • soft drop shadow
+        • semi-transparent color tint
+        • anti-aliased rounded border
+        color: BGR tuple
+        """
+        x1, y1 = map(int, pt1); x2, y2 = map(int, pt2)
+        if x2 < x1: x1, x2 = x2, x1
+        if y2 < y1: y1, y2 = y2, y1
+        H, W = img.shape[:2]
+        x1 = max(0, min(W-1, x1)); x2 = max(0, min(W, x2))
+        y1 = max(0, min(H-1, y1)); y2 = max(0, min(H, y2))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return
 
+        # --- helpers ---
+        def rounded(mask, x1, y1, x2, y2, r, val=255):
+            r = int(max(0, min(r, (x2-x1)//2, (y2-y1)//2)))
+            if r == 0:
+                cv2.rectangle(mask, (x1, y1), (x2-1, y2-1), val, -1)
+                return
+            cv2.rectangle(mask, (x1+r, y1), (x2-r, y2-1), val, -1)
+            cv2.rectangle(mask, (x1, y1+r), (x2-1, y2-r), val, -1)
+            cv2.circle(mask, (x1+r, y1+r), r, val, -1)
+            cv2.circle(mask, (x2-r-1, y1+r), r, val, -1)
+            cv2.circle(mask, (x1+r, y2-r-1), r, val, -1)
+            cv2.circle(mask, (x2-r-1, y2-r-1), r, val, -1)
+
+        def blend_mask(base, overlay, mask_u8):
+            m = (mask_u8.astype(np.float32) / 255.0)[..., None]  # HxWx1
+            return (overlay.astype(np.float32) * m + base.astype(np.float32) * (1.0 - m)).astype(np.uint8)
+
+        # --- shadow (soft, offset) ---
+        if shadow and shadow > 0:
+            m_shadow = np.zeros((H, W), np.uint8)
+            rounded(m_shadow, x1+shadow, y1+shadow, x2+shadow, y2+shadow, radius)
+            m_shadow = cv2.GaussianBlur(m_shadow, (0, 0), 5.0)
+            dark = (img.astype(np.float32) * 0.7).astype(np.uint8)  # 30% darker under shadow
+            img[:] = blend_mask(img, dark, m_shadow)
+
+        # --- main fill (semi-transparent tint inside rounded rect) ---
+        mask = np.zeros((H, W), np.uint8)
+        rounded(mask, x1, y1, x2, y2, radius)
+        # optional feather for softer edges
+        mask = cv2.GaussianBlur(mask, (0, 0), 0.8)
+
+        overlay = np.zeros_like(img); overlay[:] = color
+        # pre-mix alpha so fill isn’t fully opaque
+        mixed = (overlay.astype(np.float32) * alpha + img.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+        img[:] = blend_mask(img, mixed, mask)
+
+        # --- crisp anti-aliased border following the rounded shape ---
+        if border and border > 0:
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                # slightly brighter border for pop
+                b, g, r = map(int, color)
+                border_col = (min(255, int(b*1.2)), min(255, int(g*1.2)), min(255, int(r*1.2)))
+                cv2.drawContours(img, cnts, -1, border_col, border, lineType=cv2.LINE_AA)
     def draw_box(
         self,
         cv_image: np.ndarray,
-        detection: Detection,
-        color: Tuple[int],
-    ) -> np.ndarray:
+        detection,  # Detection
+        color: Tuple[int, int, int],
+        ) -> np.ndarray:
+        """
+        Pretty rotated box with label pill & text outline.
+        `color` is BGR (OpenCV).
+        """
+        class_name = detection.class_name or "obj"
+        score = detection.score if detection.score is not None else 0.0
+        box_msg = detection.bbox  # BoundingBox2D
+        track_id = getattr(detection, "id", None)
 
-        # get detection info
-        class_name = detection.class_name
-        score = detection.score
-        box_msg: BoundingBox2D = detection.bbox
-        track_id = detection.id
+        cx = float(box_msg.center.position.x)
+        cy = float(box_msg.center.position.y)
+        w  = float(box_msg.size.x)
+        h  = float(box_msg.size.y)
+        ang_deg = -np.degrees(float(getattr(box_msg.center, "theta", 0.0)))  # match your previous sign
 
-        min_pt = (
-            round(box_msg.center.position.x - box_msg.size.x / 2.0),
-            round(box_msg.center.position.y - box_msg.size.y / 2.0),
-        )
-        max_pt = (
-            round(box_msg.center.position.x + box_msg.size.x / 2.0),
-            round(box_msg.center.position.y + box_msg.size.y / 2.0),
-        )
+        # Build rotated rect via OpenCV (more stable than manual matrix math)
+        rect = ((cx, cy), (max(1.0, w), max(1.0, h)), ang_deg)
+        box = cv2.boxPoints(rect)              # 4x2 float
+        box_i = np.intp(np.round(box))         # int coords
 
-        # define the four corners of the rectangle
-        rect_pts = np.array(
-            [
-                [min_pt[0], min_pt[1]],
-                [max_pt[0], min_pt[1]],
-                [max_pt[0], max_pt[1]],
-                [min_pt[0], max_pt[1]],
-            ]
-        )
+        # ---- draw outline with a soft "shadow" first (contrast on bright bg)
+        shadow_col = (0, 0, 0)
+        cv2.polylines(cv_image, [box_i], isClosed=True, color=shadow_col, thickness=4, lineType=cv2.LINE_AA)
+        cv2.polylines(cv_image, [box_i], isClosed=True, color=color,       thickness=2, lineType=cv2.LINE_AA)
 
-        # calculate the rotation matrix
-        rotation_matrix = cv2.getRotationMatrix2D(
-            (box_msg.center.position.x, box_msg.center.position.y),
-            -np.rad2deg(box_msg.center.theta),
-            1.0,
-        )
+        # ---- draw small corner dots (subtle styling)
+        for pt in box_i:
+            cv2.circle(cv_image, tuple(pt), 2, color, -1, lineType=cv2.LINE_AA)
 
-        # rotate the corners of the rectangle
-        rect_pts = np.int0(cv2.transform(np.array([rect_pts]), rotation_matrix)[0])
+        # ---- label text
+        id_part = f" ({track_id})" if track_id not in (None, "", -1) else ""
+        label = f"{class_name}{id_part}  {score:.3f}"
 
-        # Draw the rotated rectangle
-        for i in range(4):
-            pt1 = tuple(rect_pts[i])
-            pt2 = tuple(rect_pts[(i + 1) % 4])
-            cv2.line(cv_image, pt1, pt2, color, 2)
-
-        # write text
-        label = f"{class_name}"
-        label += f" ({track_id})" if track_id else ""
-        label += " ({:.3f})".format(score)
-        pos = (min_pt[0] + 5, min_pt[1] + 25)
+        # Measure text
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(cv_image, label, pos, font, 1, color, 1, cv2.LINE_AA)
+        font_scale = 0.5
+        thickness_text = 1
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness_text)
+        pad = 6
+
+        # Place label above the topmost box point if possible; otherwise inside
+        topmost = box_i[np.argmin(box[:, 1])]
+        lx = int(topmost[0] - tw // 2)  # center text over topmost x
+        ly = int(topmost[1] - 8 - th)   # a bit above the box edge
+
+        # Keep on-screen; if off top, move inside the box
+        h_img, w_img = cv_image.shape[:2]
+        lx = max(2, min(w_img - tw - 2, lx))
+        ly = int(min(box[:, 1]) + th + pad + 2)
+        # Background pill (semi-transparent)
+        self._draw_filled_transparent_rect(
+            cv_image,
+            (lx - pad, ly - th - pad),
+            (lx + tw + pad, ly + baseline + pad // 2),
+            color=color,
+            alpha=0.65,
+            border=1
+        )
+
+        # Text with thin dark outline for readability
+        # Outline: draw black text slightly thicker underneath
+        cv2.putText(cv_image, label, (lx, ly), font, font_scale, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(cv_image, label, (lx, ly), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # ---- optional: draw a small center crosshair & heading tick
+        cc = (int(round(cx)), int(round(cy)))
+        cv2.circle(cv_image, cc, 2, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        # heading tick (10 px from center along the box angle)
+        rad = np.radians(-ang_deg)
+        tip = (int(round(cx + 10 * np.cos(rad))), int(round(cy + 10 * np.sin(rad))))
+        cv2.line(cv_image, cc, tip, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
         return cv_image
-
     def draw_mask(
         self,
         cv_image: np.ndarray,
